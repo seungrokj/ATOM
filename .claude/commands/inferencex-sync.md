@@ -37,7 +37,7 @@ Rules:
 
 ## 2) Create a throughput table from ATOM upstream benchmark
 
-Check the ATOM upstream benchmark that is from the latest successful gh action runs at https://github.com/ROCm/ATOM/actions/workflows/atom-benchmark.yaml and append the throughput to the InferenceX performance table in Step 1) 
+Check the ATOM upstream benchmark that is from the latest successful gh action runs at https://github.com/ROCm/ATOM/actions/workflows/atom-benchmark.yaml, which as all jobs passed. Append the throughput to the InferenceX performance table in Step 1) 
 
 Rules:
 - 1. Use main branch. Find the latest job of https://github.com/ROCm/ATOM/actions/workflows/atom-benchmark.yaml where all jobs passed    
