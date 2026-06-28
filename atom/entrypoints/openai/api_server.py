@@ -941,6 +941,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     seq_ids,
                     num_prompt_tokens,
                     cleanup_streaming_request,
+                    tools=request.tools,
                 )
             else:
                 seq_id, stream_queue, num_prompt_tokens = await setup_streaming_request(
@@ -957,6 +958,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     seq_id,
                     num_prompt_tokens,
                     cleanup_streaming_request,
+                    tools=request.tools,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -974,7 +976,9 @@ async def chat_completions(request: ChatCompletionRequest):
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_chat_response_multi(request_id, model_name, outputs)
+            resp = build_chat_response_multi(
+                request_id, model_name, outputs, tools=request.tools
+            )
         elif is_multimodal:
             final_output = None
             async for output in generate_async_multimodal(
@@ -987,7 +991,11 @@ async def chat_completions(request: ChatCompletionRequest):
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
-                request_id, model_name, final_output["text"], final_output
+                request_id,
+                model_name,
+                final_output["text"],
+                final_output,
+                tools=request.tools,
             )
         elif effective_n > 1:
             outputs = await generate_async_fanout(
@@ -998,7 +1006,9 @@ async def chat_completions(request: ChatCompletionRequest):
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_chat_response_multi(request_id, model_name, outputs)
+            resp = build_chat_response_multi(
+                request_id, model_name, outputs, tools=request.tools
+            )
         else:
             final_output = None
             async for output in generate_async(
@@ -1011,7 +1021,11 @@ async def chat_completions(request: ChatCompletionRequest):
             if final_output is None:
                 raise RuntimeError("No output generated")
             resp = build_chat_response(
-                request_id, model_name, final_output["text"], final_output
+                request_id,
+                model_name,
+                final_output["text"],
+                final_output,
+                tools=request.tools,
             )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
