@@ -1234,11 +1234,32 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         messages = [ChatMessage(**m) for m in openai_messages]
 
         merged_kwargs = dict(default_chat_template_kwargs)
+        openai_tools = anthropic_to_openai_tools(request.tools)
+        # Convert Anthropic tool_choice to OpenAI format for the chat template
+        tc = request.tool_choice
+        if tc is not None:
+            if isinstance(tc, dict):
+                tc_type = tc.get("type", "auto")
+                if tc_type == "any":
+                    merged_kwargs["tool_choice"] = "required"
+                elif tc_type == "tool":
+                    merged_kwargs["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": tc.get("name", "")},
+                    }
+                elif tc_type == "none":
+                    merged_kwargs["tool_choice"] = "none"
+                else:
+                    merged_kwargs["tool_choice"] = "auto"
+            elif isinstance(tc, str):
+                merged_kwargs["tool_choice"] = tc
+        elif openai_tools:
+            merged_kwargs["tool_choice"] = "auto"
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
             [msg.to_template_dict() for msg in messages],
-            tools=anthropic_to_openai_tools(request.tools),
+            tools=openai_tools,
             **merged_kwargs,
         )
 
@@ -1294,7 +1315,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 reasoning_filter = ReasoningFilter()
                 if prompt.rstrip().endswith("<think>"):
                     reasoning_filter.state = 1
-                tool_parser = ToolCallStreamParser()
+                tool_parser = ToolCallStreamParser(tools=openai_tools)
                 block_index = 0
                 started_text = False
                 started_thinking = False
@@ -1467,7 +1488,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         raw_text = final_output["text"]
         reasoning_content, content_with_tools = separate_reasoning(raw_text)
-        content_text, tool_calls = parse_tool_calls(content_with_tools)
+        content_text, tool_calls = parse_tool_calls(content_with_tools, openai_tools)
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         if not getattr(request, "thinking", None):
