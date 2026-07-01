@@ -25,7 +25,6 @@ from openai_harmony import (
     Role,
     StreamableParser,
     SystemContent,
-    TextContent,
     ToolDescription,
     load_harmony_encoding,
 )
@@ -205,23 +204,22 @@ def _parse_single_message(
         msgs.append(analysis)
 
     # Default: user/assistant/system messages
-    content = chat_msg.get("content") or ""
-    if isinstance(content, str):
-        contents = [TextContent(text=content)]
-    else:
-        contents = [TextContent(text=c.get("text", "")) for c in content]
+    text = _flatten_content(chat_msg.get("content")) or ""
 
-    if role == "assistant" and contents and contents[0].text:
-        msg = Message.from_role_and_contents(role, contents)
+    _role_map = {"user": Role.USER, "assistant": Role.ASSISTANT,
+                 "system": Role.SYSTEM, "developer": Role.DEVELOPER}
+
+    if role == "assistant" and text:
+        msg = Message.from_role_and_content(Role.ASSISTANT, text)
         msg = msg.with_channel("final")
         msgs.append(msg)
     elif role in ("system", "developer"):
-        text = _flatten_content(chat_msg.get("content"))
         if text:
             dev_msg = get_developer_message(instructions=text)
             msgs.append(dev_msg)
     elif role != "assistant":
-        msg = Message.from_role_and_contents(role, contents)
+        hr = _role_map.get(role, Role.USER)
+        msg = Message.from_role_and_content(hr, text)
         msgs.append(msg)
 
     return msgs
