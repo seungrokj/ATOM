@@ -959,6 +959,9 @@ async def chat_completions(request: ChatCompletionRequest):
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
             merged_kwargs.update(request.chat_template_kwargs)
+        tool_choice_val = request.get_tool_choice_value()
+        if tool_choice_val is not None:
+            merged_kwargs["tool_choice"] = tool_choice_val
 
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(

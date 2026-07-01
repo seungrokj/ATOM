@@ -230,6 +230,14 @@ class ChatCompletionRequest(BaseModel):
             return None
         return [t.model_dump() for t in self.tools]
 
+    def get_tool_choice_value(self) -> Optional[Union[str, Dict[str, Any]]]:
+        """Return tool_choice as a JSON-serializable value for chat templates."""
+        if self.tool_choice is None:
+            return None
+        if isinstance(self.tool_choice, str):
+            return self.tool_choice
+        return self.tool_choice.model_dump()
+
 
 class CompletionRequest(BaseModel):
     """Request model for text completions (OpenAI-compatible)."""
