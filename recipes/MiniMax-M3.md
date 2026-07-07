@@ -259,3 +259,584 @@ Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
 | 16 | 160 | 78.17 | 430.34 | 2680.95 | 7.91 | 15.58 | 1876.30 | 16928.43 |
 | 32 | 320 | 125.69 | 609.24 | 5304.23 | 12.60 | 23.81 | 2355.93 | 21132.49 |
 | 64 | 640 | 198.58 | 966.20 | 10476.78 | 19.97 | 40.44 | 2973.94 | 26857.80 |
+
+---
+
+## ATOMESH PD Disaggregation
+
+ATOMESH Prefill-Decode disaggregation separates the prefill and decode phases onto dedicated GPU groups, connected via Mooncake RDMA KV cache transfer and fronted by the `atomesh` router. This section covers four deployment topologies:
+
+| Topology | Quant | Nodes | Prefill | Decode | Features |
+|---|---|---:|---|---|---|
+| 1P+1D single-node | MXFP4 | 1 | GPU 0-3 (TP=4) | GPU 4-7 (TP=4) | Pure TP |
+| 1P+1D single-node | MXFP8 | 1 | GPU 0-3 (TP=4) | GPU 4-7 (TP=4) | Pure TP |
+| 2P+1D multi-node | MXFP4 | 3 | 2 nodes (TP=4 each) | 1 node (TP=4) | DPA + TBO |
+| 2P+1D multi-node | MXFP8 | 3 | 2 nodes (TP=4 each) | 1 node (TP=4) | DPA + TBO |
+| 1P+1D single-node | MXFP4 | 1 | GPU 0-3 (TP=4) | GPU 4-7 (TP=4) | EAGLE3 |
+| 1P+1D single-node | MXFP8 | 1 | GPU 0-3 (TP=4) | GPU 4-7 (TP=4) | EAGLE3 |
+| 2P+1D multi-node | MXFP4 | 3 | 2 nodes (TP=4 each) | 1 node (TP=4) | DPA + TBO + EAGLE3 |
+| 2P+1D multi-node | MXFP8 | 3 | 2 nodes (TP=4 each) | 1 node (TP=4) | DPA + TBO + EAGLE3 |
+
+### Prerequisites
+
+- AMD MI355X GPUs (8 per node)
+- RDMA network connectivity (RoCE or InfiniBand) for multi-node setups
+- Shared filesystem mounting model weights at the same path on all nodes
+- Docker image: `rocm/atom-dev:latest` (or a specific nightly, e.g. `rocm/atom-dev:nightly_202607011530`)
+
+### Common Environment Variables
+
+All topologies require these environment variables:
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=<node_routable_ip>
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+```
+
+### Common Server Flags
+
+Both MXFP4 and MXFP8 share these flags:
+
+| Flag | Value | Purpose |
+|---|---|---|
+| `--kv_cache_dtype` | `fp8` | FP8 KV cache for memory efficiency |
+| `--block-size` | `128` | KV cache block size |
+| `--gpu-memory-utilization` | `0.8` | GPU memory fraction |
+| `--max-model-len` | `32768` | Maximum sequence length |
+| `--max-num-seqs` | `256` | Max concurrent sequences (prefill) |
+| `--max-num-batched-tokens` | `32768` | Max tokens per batch |
+| `--no-enable_prefix_caching` | | Disable prefix cache for PD mode |
+| `--hf-overrides` | `'{"use_index_cache": true, "index_topk_freq": 4}'` | Index cache for MoE routing |
+| `--online_quant_config` | _(see below)_ | Online FP8 quantization |
+
+Online quant config (shared by both quant types):
+
+```json
+{
+  "global_quant_config": "ptpc_fp8",
+  "exclude_layer": [
+    "lm_head", "model.embed_tokens",
+    "vision_tower", "multi_modal_projector", "patch_merge_mlp",
+    "*block_sparse_moe"
+  ]
+}
+```
+
+---
+
+### Topology 1: Single-Node 1P+1D (MXFP4 / MXFP8)
+
+Splits one 8-GPU node into a prefill group (GPU 0-3) and a decode group (GPU 4-7), each running TP=4. The `atomesh` router runs on the same node.
+
+```
+ Node (8x MI355X)
+ +-----------------+-----------------+
+ | GPU 0-3         | GPU 4-7         |
+ | Prefill (TP=4)  | Decode (TP=4)   |
+ | port 8010       | port 8020       |
+ +-----------------+-----------------+
+          |                |
+          +---- atomesh ---+
+               port 8000
+```
+
+#### Step 1: Start Docker Container
+
+```bash
+docker run -d --name atomesh \
+    --network host --ipc host --privileged \
+    --device /dev/kfd --device /dev/dri \
+    --group-add video \
+    --cap-add IPC_LOCK --cap-add NET_ADMIN \
+    --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
+    --shm-size 128G \
+    -v /mnt:/mnt \
+    rocm/atom-dev:latest sleep infinity
+```
+
+#### Step 2: Start Prefill Server
+
+```bash
+docker exec -it atomesh bash
+
+export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export PYTHONUNBUFFERED=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=${NODE_IP}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+# For MXFP4:
+MODEL_PATH=/mnt/models/MiniMax-M3-MXFP4
+# For MXFP8:
+# MODEL_PATH=/mnt/models/MiniMax-M3-MXFP8
+
+python3 -m atom.entrypoints.openai_server \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 --server-port 8010 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --kv_cache_dtype fp8 \
+    --block-size 128 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"'"${NODE_IP}"'","handshake_port":6301}' \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    2>&1 | tee /workspace/logs/prefill.log
+```
+
+#### Step 3: Start Decode Server
+
+In another terminal on the same container:
+
+```bash
+docker exec -it atomesh bash
+
+export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+export HIP_VISIBLE_DEVICES=4,5,6,7
+export PYTHONUNBUFFERED=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=${NODE_IP}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+# For MXFP4:
+MODEL_PATH=/mnt/models/MiniMax-M3-MXFP4
+# For MXFP8:
+# MODEL_PATH=/mnt/models/MiniMax-M3-MXFP8
+
+python3 -m atom.entrypoints.openai_server \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 --server-port 8020 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --kv_cache_dtype fp8 \
+    --block-size 128 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"'"${NODE_IP}"'","handshake_port":6301}' \
+    --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    2>&1 | tee /workspace/logs/decode.log
+```
+
+Key differences from prefill:
+- `kv_role: kv_consumer` -- receives KV cache from the prefill server
+- `--cudagraph-capture-sizes` -- enables CUDAGraph capture for decode batch sizes
+
+#### Step 4: Start ATOMESH Router
+
+Wait until both servers report `/health` as healthy, then in another terminal:
+
+```bash
+docker exec -it atomesh bash
+
+export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://${NODE_IP}:8010" \
+    --decode  "http://${NODE_IP}:8020" \
+    --policy random \
+    --backend atom \
+    --log-dir /workspace/logs \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker \
+    --prometheus-port 29100 \
+    2>&1 | tee /workspace/logs/router.log
+```
+
+#### Step 5: Smoke Test
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"/mnt/models/MiniMax-M3-MXFP4","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
+```
+
+---
+
+### Topology 2: Multi-Node 2P+1D with DPA + TBO (MXFP4 / MXFP8)
+
+Scales to 3 nodes: two prefill instances (TP=4 each) with Data-Parallel Attention (DPA) and Token-Block Overlap (TBO), and one decode instance (TP=4) with DPA. Each instance runs in its own container to avoid port conflicts.
+
+```
+ Node 0 (Prefill-1)        Node 1 (Prefill-2)        Node 2 (Decode)
+ GPU 0-3, TP=4             GPU 0-3, TP=4             GPU 0-3, TP=4
+ port 8010                 port 8010                 port 8020
+ DPA + TBO                 DPA + TBO                 DPA
+         \                      |                      /
+          +---------- atomesh router ---------+
+                    port 8000 (on Node 0)
+```
+
+#### Step 1: Start Docker Container on Each Node
+
+On each of the 3 nodes:
+
+```bash
+docker run -d --name atomesh \
+    --network host --ipc host --privileged \
+    --device /dev/kfd --device /dev/dri \
+    --device /dev/infiniband \
+    --group-add video \
+    --cap-add IPC_LOCK --cap-add NET_ADMIN \
+    --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
+    --shm-size 128G \
+    -v /mnt:/mnt \
+    rocm/atom-dev:latest sleep infinity
+
+# Tune TCP backlog for high-concurrency workloads
+docker exec atomesh bash -c '
+    sysctl -w net.core.somaxconn=4096 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_max_syn_backlog=4096 2>/dev/null || true
+'
+```
+
+> For RDMA NICs other than Mellanox (e.g. Broadcom bnxt, Pensando ionic), you may need to bind-mount host-side ibverbs provider libraries into the container.
+
+#### Step 2: Start Prefill Servers (Node 0 and Node 1)
+
+On **each prefill node**, enter the container and run:
+
+```bash
+docker exec -it atomesh bash
+
+export PREFILL_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export PYTHONUNBUFFERED=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=${PREFILL_IP}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+# For MXFP4:
+MODEL_PATH=/mnt/models/MiniMax-M3-MXFP4
+# For MXFP8:
+# MODEL_PATH=/mnt/models/MiniMax-M3-MXFP8
+
+python3 -m atom.entrypoints.openai_server \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 --server-port 8010 \
+    --trust-remote-code \
+    --kv_cache_dtype fp8 \
+    -tp 4 \
+    --enable-dp-attention \
+    --enable-tbo prefill \
+    --gpu-memory-utilization 0.8 \
+    --block-size 128 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"'"${PREFILL_IP}"'","handshake_port":6301}' \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    2>&1 | tee /workspace/logs/prefill.log
+```
+
+Key DPA/TBO flags:
+- `--enable-dp-attention` -- enables Data-Parallel Attention (each TP group handles separate sequences in parallel)
+- `--enable-tbo prefill` -- enables Token-Block Overlap for the prefill phase (overlaps computation with KV transfer)
+
+#### Step 3: Start Decode Server (Node 2)
+
+On the decode node:
+
+```bash
+docker exec -it atomesh bash
+
+export DECODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export PYTHONUNBUFFERED=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+export ATOM_HOST_IP=${DECODE_IP}
+export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+
+rm -rf /root/.cache/atom/* 2>/dev/null || true
+
+# For MXFP4:
+MODEL_PATH=/mnt/models/MiniMax-M3-MXFP4
+# For MXFP8:
+# MODEL_PATH=/mnt/models/MiniMax-M3-MXFP8
+
+python3 -m atom.entrypoints.openai_server \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 --server-port 8020 \
+    --trust-remote-code \
+    --kv_cache_dtype fp8 \
+    -tp 4 \
+    --enable-dp-attention \
+    --gpu-memory-utilization 0.8 \
+    --block-size 128 \
+    --max-model-len 32768 \
+    --max-num-seqs 1024 \
+    --max-num-batched-tokens 32768 \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"'"${DECODE_IP}"'","handshake_port":6301}' \
+    --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    2>&1 | tee /workspace/logs/decode.log
+```
+
+Key differences from the single-node decode:
+- `--max-num-seqs 1024` -- higher decode batch capacity to absorb traffic from 2 prefill instances
+- `--enable-dp-attention` -- required for DPA-aware scheduling
+- No `--enable-tbo` -- TBO is only used on prefill instances
+
+#### Step 4: Start ATOMESH Router (Node 0)
+
+Wait until all three servers report `/health` as healthy, then on Node 0:
+
+```bash
+docker exec -it atomesh bash
+
+PREFILL_IP_1=<node0_ip>
+PREFILL_IP_2=<node1_ip>
+DECODE_IP=<node2_ip>
+
+atomesh launch \
+    --host 0.0.0.0 --port 8000 \
+    --pd-disaggregation \
+    --prefill "http://${PREFILL_IP_1}:8010" \
+    --prefill "http://${PREFILL_IP_2}:8010" \
+    --decode  "http://${DECODE_IP}:8020" \
+    --policy random \
+    --backend atom \
+    --log-dir /workspace/logs \
+    --log-level info \
+    --disable-health-check \
+    --disable-circuit-breaker \
+    --prometheus-port 29100 \
+    2>&1 | tee /workspace/logs/router.log
+```
+
+#### Step 5: Smoke Test
+
+```bash
+curl -sS -X POST http://<PREFILL_IP_1>:8000/v1/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"/mnt/models/MiniMax-M3-MXFP4","prompt":"The capital of France is","max_tokens":16,"temperature":0}'
+```
+
+---
+
+### Enabling EAGLE3 Speculative Decoding in PD Mode
+
+EAGLE3 can be combined with any of the PD topologies above. Add three flags to **both** the prefill and decode server commands:
+
+```
+--method eagle3
+--draft-model /mnt/models/MiniMax-M3-EAGLE3
+--num-speculative-tokens 3
+```
+
+The draft checkpoint is [`Inferact/MiniMax-M3-EAGLE3`](https://huggingface.co/Inferact/MiniMax-M3-EAGLE3). The router configuration is unchanged -- EAGLE3 is transparent to the atomesh router.
+
+#### Single-Node 1P+1D + EAGLE3 (MXFP4 / MXFP8)
+
+Use the same container and router setup as Topology 1. The only change is the server launch commands for prefill and decode.
+
+**Prefill server** (add EAGLE3 flags):
+
+```bash
+# (same env exports as Topology 1 Step 2)
+
+# For MXFP4:
+MODEL_PATH=/mnt/models/MiniMax-M3-MXFP4
+# For MXFP8:
+# MODEL_PATH=/mnt/models/MiniMax-M3-MXFP8
+DRAFT_MODEL_PATH=/mnt/models/MiniMax-M3-EAGLE3
+
+python3 -m atom.entrypoints.openai_server \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 --server-port 8010 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --kv_cache_dtype fp8 \
+    --block-size 128 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"'"${NODE_IP}"'","handshake_port":6301}' \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    --method eagle3 \
+    --draft-model "${DRAFT_MODEL_PATH}" \
+    --num-speculative-tokens 3 \
+    2>&1 | tee /workspace/logs/prefill.log
+```
+
+**Decode server** (add EAGLE3 flags):
+
+```bash
+# (same env exports as Topology 1 Step 3)
+
+python3 -m atom.entrypoints.openai_server \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 --server-port 8020 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --kv_cache_dtype fp8 \
+    --block-size 128 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"'"${NODE_IP}"'","handshake_port":6301}' \
+    --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    --method eagle3 \
+    --draft-model "${DRAFT_MODEL_PATH}" \
+    --num-speculative-tokens 3 \
+    2>&1 | tee /workspace/logs/decode.log
+```
+
+The router launch is identical to Topology 1 Step 4.
+
+#### Multi-Node 2P+1D + DPA + TBO + EAGLE3 (MXFP4 / MXFP8)
+
+Use the same container and router setup as Topology 2. Add EAGLE3 flags to all three server instances.
+
+**Prefill servers** (on each prefill node, add EAGLE3 flags):
+
+```bash
+# (same env exports as Topology 2 Step 2)
+
+DRAFT_MODEL_PATH=/mnt/models/MiniMax-M3-EAGLE3
+
+python3 -m atom.entrypoints.openai_server \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 --server-port 8010 \
+    --trust-remote-code \
+    --kv_cache_dtype fp8 \
+    -tp 4 \
+    --enable-dp-attention \
+    --enable-tbo prefill \
+    --gpu-memory-utilization 0.8 \
+    --block-size 128 \
+    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 32768 \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+    --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"'"${PREFILL_IP}"'","handshake_port":6301}' \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    --method eagle3 \
+    --draft-model "${DRAFT_MODEL_PATH}" \
+    --num-speculative-tokens 3 \
+    2>&1 | tee /workspace/logs/prefill.log
+```
+
+**Decode server** (on decode node, add EAGLE3 flags):
+
+```bash
+# (same env exports as Topology 2 Step 3)
+
+DRAFT_MODEL_PATH=/mnt/models/MiniMax-M3-EAGLE3
+
+python3 -m atom.entrypoints.openai_server \
+    --model "${MODEL_PATH}" \
+    --host 0.0.0.0 --server-port 8020 \
+    --trust-remote-code \
+    --kv_cache_dtype fp8 \
+    -tp 4 \
+    --enable-dp-attention \
+    --gpu-memory-utilization 0.8 \
+    --block-size 128 \
+    --max-model-len 32768 \
+    --max-num-seqs 1024 \
+    --max-num-batched-tokens 32768 \
+    --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"'"${DECODE_IP}"'","handshake_port":6301}' \
+    --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
+    --no-enable_prefix_caching \
+    --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+    --method eagle3 \
+    --draft-model "${DRAFT_MODEL_PATH}" \
+    --num-speculative-tokens 3 \
+    2>&1 | tee /workspace/logs/decode.log
+```
+
+The router launch is identical to Topology 2 Step 4.
+
+---
+
+### PD Accuracy Validation (GSM8K)
+
+GSM8K 5-shot via the router endpoint (works for all topologies):
+
+```bash
+pip install 'lm-eval[api]'
+
+model_path=/mnt/models/MiniMax-M3-MXFP4   # or MiniMax-M3-MXFP8
+ROUTER_URL=http://127.0.0.1:8000
+NUM_CONCURRENT=64                           # increase for multi-node (e.g. 256,512)
+
+lm_eval --model local-chat-completions \
+    --model_args "model=${model_path},base_url=${ROUTER_URL}/v1/chat/completions,num_concurrent=${NUM_CONCURRENT},max_retries=3,max_gen_toks=16384" \
+    --tasks gsm8k \
+    --num_fewshot 5 \
+    --batch_size 65 \
+    --apply_chat_template \
+    --fewshot_as_multiturn
+```
+
+### PD Serving Benchmark
+
+```bash
+git clone --depth 1 https://github.com/kimbochen/bench_serving.git /tmp/bench_serving
+
+MODEL_PATH=/mnt/models/MiniMax-M3-MXFP4    # or MiniMax-M3-MXFP8
+ROUTER_URL=http://127.0.0.1:8000
+ISL=8192
+OSL=1024
+CONC=64                                     # for 2P+1D, try 256,512,768,1024
+
+python3 /tmp/bench_serving/benchmark_serving.py \
+    --model="${MODEL_PATH}" \
+    --backend=vllm \
+    --base-url="${ROUTER_URL}" \
+    --dataset-name=random \
+    --random-input-len="${ISL}" \
+    --random-output-len="${OSL}" \
+    --random-range-ratio 0.8 \
+    --num-prompts=$(( CONC * 10 )) \
+    --max-concurrency="${CONC}" \
+    --trust-remote-code \
+    --num-warmups=$(( 2 * CONC )) \
+    --request-rate=inf \
+    --ignore-eos \
+    --save-result \
+    --percentile-metrics='ttft,tpot,itl,e2el' \
+    --result-dir=/workspace/benchmark_results \
+    --result-filename="pd-atom-minimax-m3-${ISL}-${OSL}-${CONC}.json"
+```
+
+The benchmark client uses `--backend=vllm` because the atomesh router exposes OpenAI-compatible `/v1/completions` regardless of the upstream backend.
+
